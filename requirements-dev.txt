@@ -1,0 +1,13 @@
+# Development tooling. Not needed to run or deploy the demo.
+#
+#   .venv/bin/python -m pip install -r requirements-dev.txt
+#   .venv/bin/python -m ruff check .
+#   .venv/bin/python -m ruff format --check .
+
+-r requirements.txt
+
+# Lint and format. Configured in pyproject.toml.
+ruff==0.15.1
+
+# FastAPI's TestClient, used by verify_api.py.
+httpx==0.28.1

@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Demo infrastructure for Web Search on Amazon Bedrock AgentCore. Creates an
+  AgentCore Gateway (MCP protocol, AWS_IAM / SigV4 inbound auth), the IAM service
+  role the Gateway assumes for outbound calls, and a Gateway target that attaches
+  the AWS-managed "web-search" connector. This is the entire footprint for
+  Option 3 of the demo -- there is no other persistent infrastructure.
+
+Parameters:
+  GatewayName:
+    Type: String
+    Default: WebSearchDemoGateway
+    Description: Name of the AgentCore Gateway.
+    AllowedPattern: "^[a-zA-Z0-9_-]{1,100}$"
+
+  TargetName:
+    Type: String
+    Default: web-search-tool
+    Description: >
+      Name of the Gateway target. The Gateway namespaces the tool it exposes as
+      <TargetName>___WebSearch, so this value shows up in the agent's tool list.
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9_-]*$"
+
+Resources:
+  # Outbound permission to reach the Web Search backend. Kept as a customer-managed
+  # policy rather than an inline policy so it is independently versioned and
+  # auditable. It carries no gateway-scoped statement, so it has no dependency on
+  # the Gateway and can be created first.
+  GatewayServicePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Outbound Web Search permission for the AgentCore demo Gateway.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # The Web Search tool ARN is owned by AWS (account segment is literally
+          # "aws"). Authorization is enforced per invocation against this ARN.
+          # NOTE: the region segment is required here. The empty-region form shown
+          # in some docs (arn:aws:bedrock-agentcore::aws:tool/web-search.v1) is
+          # rejected at target-creation time.
+          - Sid: InvokeWebSearch
+            Effect: Allow
+            Action: bedrock-agentcore:InvokeWebSearch
+            Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:aws:tool/web-search.v1"
+
+  # The role the AgentCore service assumes to reach the Web Search backend.
+  # This is outbound auth only. Inbound auth (who may call the Gateway) is the
+  # AWS_IAM authorizer below. This role deliberately has no bedrock:InvokeModel --
+  # model access belongs to the identity running the agent, not to the Gateway.
+  GatewayServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Service role assumed by the AgentCore Gateway for the Web Search connector.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAgentCoreToAssumeRole
+            Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              # Confused-deputy protection: only this account's Gateways may
+              # assume the role.
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+      ManagedPolicyArns:
+        - !Ref GatewayServicePolicy
+
+  # The Gateway itself: a standard streamable-HTTP MCP endpoint. AWS_IAM inbound
+  # auth means callers SigV4-sign each request with their own credentials, so the
+  # demo needs no IdP, no OAuth client, and no bearer tokens.
+  Gateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Ref GatewayName
+      Description: Web Search on Amazon Bedrock AgentCore -- demo Gateway (SigV4 inbound).
+      ProtocolType: MCP
+      AuthorizerType: AWS_IAM
+      RoleArn: !GetAtt GatewayServiceRole.Arn
+
+  # InvokeGateway, scoped to exactly the Gateway this stack creates.
+  #
+  # This is a separate resource rather than a statement in the managed policy above
+  # to break a dependency cycle: the policy is attached to the role, the role is
+  # referenced by the Gateway, so the policy cannot reference the Gateway's ARN.
+  # Attaching it afterwards is what allows least-privilege scoping instead of a
+  # gateway/* wildcard across every Gateway in the account.
+  GatewayInvokePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: InvokeThisGateway
+      Roles:
+        - !Ref GatewayServiceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InvokeGateway
+            Effect: Allow
+            Action: bedrock-agentcore:InvokeGateway
+            Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${Gateway.GatewayIdentifier}"
+
+  # Attaching the managed connector is the whole integration. The Gateway
+  # snapshots the tool schema, provisions the integration, and handles endpoint
+  # resolution and service authentication.
+  WebSearchTarget:
+    # The target is what actually invokes web search, so make sure the scoped
+    # InvokeGateway permission is in place before it becomes READY.
+    DependsOn: GatewayInvokePolicy
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt Gateway.GatewayIdentifier
+      Name: !Ref TargetName
+      Description: AWS-managed Web Search connector.
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Connector:
+            Source:
+              ConnectorId: web-search
+            Configurations:
+              # Target-level domain include/exclude lists go in ParameterValues.
+              # They are hidden from the calling agent and applied to every
+              # request through this target. Left empty for the demo -- see
+              # "Configure domain filtering" in the Web Search Tool docs for the
+              # exact parameter keys before enabling them.
+              - Name: WebSearch
+                ParameterValues: {}
+
+Outputs:
+  GatewayUrl:
+    Description: MCP endpoint URL. Set this as AGENTCORE_GATEWAY_URL for the demo.
+    Value: !GetAtt Gateway.GatewayUrl
+
+  GatewayId:
+    Description: AgentCore Gateway identifier.
+    Value: !GetAtt Gateway.GatewayIdentifier
+
+  GatewayArn:
+    Description: Gateway ARN. Grant bedrock-agentcore:InvokeGateway on this to demo callers.
+    Value: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${Gateway.GatewayIdentifier}"
+
+  GatewayServiceRoleArn:
+    Description: ARN of the Gateway outbound service role.
+    Value: !GetAtt GatewayServiceRole.Arn
+
+  ToolName:
+    Description: Namespaced MCP tool name the agent will discover via tools/list.
+    Value: !Sub "${TargetName}___WebSearch"

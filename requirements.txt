@@ -1,0 +1,23 @@
+# AgentCore Web Search demo: backend dependencies, pinned for reproducibility.
+# Python 3.10-3.14 (mcp-proxy-for-aws requires <3.15).
+#
+# Web search goes through the AWS-managed Web Search tool on an AgentCore Gateway.
+# There is deliberately no third-party search SDK here.
+#
+# The front end has its own dependencies in web/package.json.
+# The Lambda package pins its own subset in deploy/lambda-requirements.txt.
+
+# API
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+# ASGI adapter used only when running on Lambda.
+mangum==0.19.0
+
+# Agent framework + Bedrock model access
+strands-agents==1.55.1
+boto3==1.43.94
+
+# MCP client + SigV4-signed Streamable HTTP transport for the AgentCore Gateway
+# (mcp is pinned to the version strands-agents 1.55.1 resolves to)
+mcp==1.30.0
+mcp-proxy-for-aws==1.7.0

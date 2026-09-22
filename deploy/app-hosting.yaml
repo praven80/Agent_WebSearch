@@ -1,0 +1,438 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Hosting for the Web Search on Amazon Bedrock AgentCore demo. A private S3 bucket
+  holds the React bundle, a Lambda function runs the FastAPI backend, and a single
+  CloudFront distribution serves both -- static from S3 by default, /api/* from the
+  Lambda -- so the demo has one HTTPS URL.
+
+Parameters:
+  GatewayUrl:
+    Type: String
+    Description: AgentCore Gateway MCP endpoint the agent connects to.
+    AllowedPattern: "^https://[a-z0-9-]+\\.gateway\\.bedrock-agentcore\\.[a-z0-9-]+\\.amazonaws\\.com/mcp$"
+
+  GatewayArn:
+    Type: String
+    Description: >
+      ARN of that Gateway. Used to scope bedrock-agentcore:InvokeGateway to exactly
+      this Gateway rather than all of them.
+
+  ModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+    Description: Bedrock model (inference profile) id the agent invokes.
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket holding the Lambda deployment zip.
+
+  LambdaCodeKey:
+    Type: String
+    Description: S3 key of the Lambda deployment zip.
+
+  OriginSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: >
+      Shared secret CloudFront injects as x-demo-origin-secret. The API Gateway
+      endpoint is public, so the Lambda rejects any request without it, which stops
+      anyone reaching the API without going through CloudFront.
+
+  ApiConcurrencyLimit:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 50
+    Description: >
+      Reserved concurrency for the API Lambda. The CloudFront URL is open to
+      anyone, and every grounded run costs roughly $0.03 in Bedrock and Web Search
+      charges, so this caps how fast that can be spent.
+
+  AuthorizerHeaderName:
+    Type: String
+    Default: x-demo-origin-secret
+    Description: >
+      Header carrying the origin secret. Declared as a parameter so the gateway
+      authorizer's identity source and the CloudFront custom header cannot drift
+      apart.
+    AllowedPattern: "^[a-z0-9-]+$"
+
+  MaxSearchResults:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 25
+    Description: Results per search, enforced server-side on every call.
+
+Resources:
+  # ---------------------------------------------------------------- static site
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    # Retain so a stack delete cannot silently discard the bundle; it is cheap and
+    # the teardown script empties it explicitly.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      # No public access at all: CloudFront reaches it through an Origin Access
+      # Control identity, so the bucket stays private.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt SiteBucket.Arn
+              - !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ---------------------------------------------------------------------- API
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Execution role for the AgentCore Web Search demo API.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: AgentCoreWebSearchDemo
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Inbound auth to the Gateway: the caller (this function) SigV4-signs
+              # its MCP requests. Scoped to the one Gateway, not gateway/*.
+              - Sid: InvokeGateway
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !Ref GatewayArn
+
+              # The model the agent runs. Cross-region inference profiles fan out
+              # to regional foundation models, so both resource forms are needed.
+              - Sid: InvokeModel
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: FastAPI backend for the AgentCore Web Search demo.
+      Runtime: python3.13
+      Architectures:
+        - x86_64
+      Handler: api.lambda_handler.handler
+      Role: !GetAtt ApiFunctionRole.Arn
+      # Agent runs take a few seconds; a search plus two model turns is well under
+      # this, and CloudFront gives up at 60s anyway.
+      Timeout: 60
+      MemorySize: 2048
+      # The demo URL is unauthenticated, so this is the spend ceiling: at most this
+      # many agent runs can be in flight, and the rest get throttled with 429
+      # rather than billed.
+      ReservedConcurrentExecutions: !Ref ApiConcurrencyLimit
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          AGENTCORE_GATEWAY_URL: !Ref GatewayUrl
+          BEDROCK_MODEL_ID: !Ref ModelId
+          MAX_SEARCH_RESULTS: !Ref MaxSearchResults
+          # Enforced by the middleware in api/lambda_handler.py: requests that did
+          # not come through CloudFront are refused.
+          DEMO_ORIGIN_SECRET: !Ref OriginSecret
+
+  # An HTTP API in front of the Lambda rather than a Function URL.
+  #
+  # A Lambda Function URL was tried first, with Origin Access Control signing. A
+  # manually SigV4-signed request reached the function fine, but CloudFront's OAC
+  # signature was rejected with 403 and the function was never invoked. Rather than
+  # keep guessing at OAC-for-Lambda behaviour, this uses the well-trodden API
+  # Gateway path and protects the origin with a shared secret header that only
+  # CloudFront knows.
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      Description: FastAPI backend for the AgentCore Web Search demo.
+      ProtocolType: HTTP
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+      # Agent runs take several seconds; this is the API Gateway ceiling.
+      TimeoutInMillis: 30000
+
+  # Minimal role for the authorizer: CloudWatch Logs only, nothing else.
+  AuthorizerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Execution role for the API Gateway request authorizer.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  # Gateway-level authorization.
+  #
+  # Without this the $default route is AuthorizationType NONE, which means the
+  # public execute-api endpoint accepts unauthenticated requests and the only
+  # thing standing in front of the agent is a check inside the application
+  # Lambda. That is a single point of failure at the wrong layer, and it is what
+  # AppSec scanners flag as "API gateway has no authorizer".
+  #
+  # The authorizer validates the same secret CloudFront injects, so the effective
+  # access rule is unchanged: only CloudFront can reach the API.
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Validates the CloudFront origin secret for the demo API.
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt AuthorizerFunctionRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Environment:
+        Variables:
+          ORIGIN_SECRET: !Ref OriginSecret
+      Code:
+        ZipFile: |
+          """Request authorizer for the AgentCore Web Search demo API."""
+
+          import hmac
+          import os
+
+          SECRET = os.environ["ORIGIN_SECRET"]
+          HEADER = "x-demo-origin-secret"
+
+
+          def handler(event, _context):
+              # Payload format 2.0 lowercases header names.
+              presented = (event.get("headers") or {}).get(HEADER, "")
+              # Constant-time compare so a timing side channel cannot leak the secret.
+              authorized = hmac.compare_digest(presented, SECRET)
+              return {"isAuthorized": authorized}
+
+  HttpApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: !Sub "${AWS::StackName}-origin-authorizer"
+      AuthorizerType: REQUEST
+      AuthorizerPayloadFormatVersion: "2.0"
+      # Simple responses let the function return {"isAuthorized": bool} instead of
+      # building an IAM policy document.
+      EnableSimpleResponses: true
+      AuthorizerUri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations"
+      # Naming the header as the identity source means API Gateway rejects a request
+      # that omits it with 401 without even invoking the authorizer, and caches the
+      # decision per secret value.
+      IdentitySource:
+        - !Sub "$request.header.${AuthorizerHeaderName}"
+      AuthorizerResultTtlInSeconds: 300
+
+  AuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AuthorizerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/authorizers/${HttpApiAuthorizer}"
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: $default
+      Target: !Sub "integrations/${HttpApiIntegration}"
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref HttpApiAuthorizer
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      # $default so the invoke URL carries no stage prefix and /api/... maps
+      # straight through to the app's routes.
+      StageName: $default
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ApiFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+  # --------------------------------------------------------------- CloudFront
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-s3-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # No viewer authentication.
+  #
+  # The demo is deliberately open so it can be shared as a plain link. Two things
+  # substitute for a login: ReservedConcurrentExecutions on the API Lambda caps
+  # spend, and MaxSearchResults caps the cost of any single run. The origin secret
+  # below is a separate concern; it stops the API being called around CloudFront,
+  # not who may call it.
+
+  # Forwards everything the API needs and caches nothing.
+  ApiOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-api-origin-request"
+        CookiesConfig:
+          CookieBehavior: none
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            # Host is deliberately NOT forwarded: the API Gateway origin rejects a
+            # mismatched Host header.
+            - content-type
+            - accept
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName}: AgentCore Web Search demo"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: s3-site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+
+          - Id: lambda-api
+            DomainName: !Sub "${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+              # Agent runs can take several seconds.
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+            # The HTTP API is reachable on the internet, so both the gateway
+            # authorizer and the application Lambda reject any request that does
+            # not carry this header. Only CloudFront sends it.
+            OriginCustomHeaders:
+              - HeaderName: !Ref AuthorizerHeaderName
+                HeaderValue: !Ref OriginSecret
+
+        DefaultCacheBehavior:
+          TargetOriginId: s3-site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: lambda-api
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            # Managed CachingDisabled: responses are per-request and must never
+            # be served from cache.
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: !Ref ApiOriginRequestPolicy
+
+        # Deliberately NO CustomErrorResponses.
+        #
+        # They are distribution-wide, so a 401/403/404 from the API origin would be
+        # rewritten to index.html with a 200 -- which silently turned every API
+        # error into an HTML page during the first deployment of this stack. The
+        # React app uses hash routing (#/run), so the server only ever sees "/" and
+        # needs no SPA fallback.
+
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+Outputs:
+  AppUrl:
+    Description: Open this in a browser. No sign-in required.
+    Value: !Sub "https://${Distribution.DomainName}"
+
+  DistributionId:
+    Description: CloudFront distribution id, for cache invalidations.
+    Value: !Ref Distribution
+
+  SiteBucketName:
+    Description: S3 bucket holding the React bundle.
+    Value: !Ref SiteBucket
+
+  ApiFunctionName:
+    Description: Lambda function name, for logs.
+    Value: !Ref ApiFunction
+
+  ApiEndpoint:
+    Description: Direct HTTP API endpoint. Returns 404 without the CloudFront origin secret.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"

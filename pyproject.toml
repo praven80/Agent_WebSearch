@@ -1,0 +1,52 @@
+# Tooling configuration. There is no package to build here: the demo runs from the
+# repository, so this file exists to pin lint and format behaviour.
+
+[tool.ruff]
+line-length = 90
+target-version = "py310"
+extend-exclude = ["build", ".venv", "web"]
+
+[tool.ruff.lint]
+select = [
+    "F",    # pyflakes: unused imports and names, real bugs
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "I",    # import sorting
+    "UP",   # pyupgrade: modern syntax for the target version
+    "B",    # bugbear: likely bugs and footguns
+    "SIM",  # simplifiable code
+    "C4",   # comprehension style
+    "RET",  # return-statement hygiene
+    "ARG",  # unused arguments
+    "PIE",  # misc lint
+    "PTH",  # prefer pathlib
+    "RUF",  # ruff's own rules
+]
+ignore = [
+    # Long lines are reported by the formatter, not the linter. Prose in docstrings
+    # and comments is deliberately wrapped for reading, not for a hard limit.
+    "E501",
+    # The codebase uses relative imports inside the demo package on purpose: it
+    # keeps the package self-contained and movable.
+    "TID252",
+    # Broad excepts are intentional at the boundaries where a failure must be
+    # reported to the UI rather than crash a demo. Each one is commented.
+    "BLE001",
+    # Ambiguous-unicode rules fire on ordinary punctuation in prose.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # A ternary is not always clearer than a short if/else block.
+    "SIM108",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The verification scripts implement third-party interfaces (the Strands Model
+# protocol and @tool signatures), so unused parameters are required by the
+# contract rather than accidental.
+"verify_pipeline.py" = ["ARG001", "ARG002"]
+# Reaching into a private helper is the point of these assertions.
+"verify_api.py" = ["ARG001"]
+
+[tool.ruff.format]
+quote-style = "double"
